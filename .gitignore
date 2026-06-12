@@ -1,0 +1,18 @@
+# development notes, not for publication
+INSIGHTS.md
+paper_code_search.md
+*.Identifier
+
+# local assets
+model_weight/
+external_source/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+tests/
+test.py

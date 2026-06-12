@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mllm-kvcompress"
+version = "0.2.0"
+description = "KV cache compression for multimodal LLMs, made easy"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3.1,<3",
+    "transformers>=4.55.0,<6",
+    "pillow",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+internvl = ["transformers>=4.55.0,<5", "einops", "timm", "torchvision"]
+
+[tool.setuptools.packages.find]
+include = ["mllm_kvcompress*"]

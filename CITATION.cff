@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If this project is helpful to your work, please cite it as below."
+title: "MLLM-KVCompress: KV cache compression for multimodal LLMs"
+type: software
+authors:
+  - family-names: "Chen"
+    given-names: "Hong"
+repository-code: "https://github.com/ChenHong30/MLLM-KVCompress"
+license: Apache-2.0
+year: 2026
