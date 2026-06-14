@@ -30,17 +30,19 @@ class MEDA(CompressionMethod):
     Based on MEDA (https://arxiv.org/abs/2502.17599, NAACL 2025),
     official implementation: https://github.com/AIoT-MLSys-Lab/MEDA.
 
-    Adaptation notes: the official implementation computes the attention entropy on the
-    full eager pre-fill attention map and compresses at the first decoding step. Here
-    both entropy and heavy-hitter scores are computed from an observation window of
-    recent queries to stay compatible with sdpa/flash attention.
+    Adaptation notes: the official implementation computes the entropy and heavy-hitter
+    scores on the full eager pre-fill attention map and compresses at the first decoding
+    step. The full map does not fit in memory for the long contexts of recent multimodal
+    models, so both are accumulated in query-chunks (the exact same all-query quantities;
+    see `LayerContext.accumulated_attention_and_entropy`).
 
     Parameters
     ----------
     ratio : float, default=0.0
         Average fraction of key-value pairs to remove across layers.
-    window_size : int, default=32
-        Number of recent queries used to compute entropy and importance scores.
+    score_chunk_size : int, default=512
+        Query-chunk size used to accumulate the entropy and importance scores from the
+        full pre-fill attention without materializing the (seq_len, seq_len) map.
     recent_fraction : float, default=0.5
         Fraction of each layer's kept budget reserved for the most recent tokens
         (the official implementation uses an equal split).
@@ -55,7 +57,7 @@ class MEDA(CompressionMethod):
     """
 
     ratio: float = 0.0
-    window_size: int = 32
+    score_chunk_size: int = 512
     recent_fraction: float = 0.5
     merge: str = "average"
     min_keep_ratio: float = 0.01
@@ -74,15 +76,11 @@ class MEDA(CompressionMethod):
         if self.ratio == 0:
             return ctx.keys, ctx.values
 
-        attn_weights = ctx.window_attention(self.window_size)
+        scores, entropy = ctx.accumulated_attention_and_entropy(self.score_chunk_size)
 
-        # Multimodal attention entropy, normalized by the number of observed queries
-        probs = attn_weights.float().clamp(min=1e-12)
-        entropy = -(probs * probs.log()).sum(dim=(-2, -1))  # (batch_size, num_heads)
-        entropy = entropy[0].mean() / attn_weights.shape[-2]
-
-        self._entropies[ctx.layer_idx] = entropy
-        self._scores[ctx.layer_idx] = ctx.to_kv_heads(attn_weights.sum(dim=-2))
+        # Multimodal attention entropy, head-mean normalized by the number of queries
+        self._entropies[ctx.layer_idx] = entropy[0].mean() / ctx.seq_len
+        self._scores[ctx.layer_idx] = ctx.to_kv_heads(scores)
         self._cache = ctx.kwargs.get("past_key_values", ctx.kwargs.get("past_key_value"))
 
         return ctx.keys, ctx.values

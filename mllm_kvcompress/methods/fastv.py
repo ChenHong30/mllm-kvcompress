@@ -30,8 +30,7 @@ class FastV(CompressionMethod):
     states after `filter_layer`, removing them from all subsequent computation. As a
     cache compression method, we instead drop the KV pairs of the selected vision
     tokens at every layer after `filter_layer` (the pre-fill computation itself is
-    unchanged). The attention ranking uses an observation window of recent queries
-    instead of the full eager attention map, for sdpa/flash attention compatibility.
+    unchanged).
 
     Parameters
     ----------
@@ -41,13 +40,10 @@ class FastV(CompressionMethod):
     filter_layer : int, default=2
         Layer whose attention is used to rank vision tokens (K of the paper).
         KV pairs are dropped at all layers strictly after this one.
-    window_size : int, default=32
-        Number of recent queries used to compute the attention ranking.
     """
 
     ratio: float = 0.0
     filter_layer: int = 2
-    window_size: int = 32
 
     _kept_positions: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
 
@@ -59,14 +55,19 @@ class FastV(CompressionMethod):
         if self.ratio == 0 or ctx.layer_idx < self.filter_layer:
             return ctx.keys, ctx.values
 
-        if ctx.layer_idx == self.filter_layer:
-            self._kept_positions = None
+        if self._kept_positions is None:
+            # First compressed layer at/after filter_layer. Keying off `is None` rather
+            # than `layer_idx == filter_layer` keeps this robust to models whose
+            # compressible (full-attention) layers do not include filter_layer exactly,
+            # e.g. the hybrid Qwen3.5 whose full-attention layers are [3, 7, 11, ...].
+            # This layer is left uncompressed, as the reference prunes only later layers.
             if ctx.vision_mask is None:
                 logger.warning_once("FastV could not find vision token positions, no compression is applied.")
                 return ctx.keys, ctx.values
 
-            # Average attention received by each position, averaged over heads and queries
-            scores = ctx.window_attention(self.window_size).mean(dim=(1, 2))  # (batch_size, seq_len)
+            # Attention received by each position from the last query, averaged over
+            # heads (the ranking signal of the reference implementation).
+            scores = ctx.window_attention(1).mean(dim=(1, 2))  # (batch_size, seq_len)
 
             # Protect text positions, then drop the least attended vision tokens
             n_vision = int(ctx.vision_mask.sum(dim=1).min().item())
@@ -78,9 +79,6 @@ class FastV(CompressionMethod):
             self._kept_positions = scores.topk(n_kept, dim=-1).indices.sort(dim=-1).values
             return ctx.keys, ctx.values
 
-        if self._kept_positions is None:
-            return ctx.keys, ctx.values
-
-        # Layers after filter_layer: drop the KV pairs of the filtered vision tokens
+        # Later compressed layers: drop the KV pairs of the filtered vision tokens
         indices = self._kept_positions[:, None, :, None].expand(-1, ctx.num_kv_heads, -1, ctx.head_dim)
         return ctx.keys.gather(2, indices).contiguous(), ctx.values.gather(2, indices).contiguous()

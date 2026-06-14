@@ -7,7 +7,12 @@ from typing import Optional
 import torch
 from torch import nn
 
-from mllm_kvcompress.core.attention import group_mean, observation_window_attention
+from mllm_kvcompress.core.attention import (
+    accumulated_attention_and_entropy,
+    accumulated_attention_scores,
+    group_mean,
+    observation_window_attention,
+)
 from mllm_kvcompress.core.modality import vision_spans
 
 
@@ -95,6 +100,36 @@ class LayerContext:
             return self.attentions[:, :, -window_size:, :]
         return observation_window_attention(
             self.module, self.hidden_states, self.keys, window_size, self.position_embeddings
+        )
+
+    def accumulated_attention(self, chunk_size: int = 512) -> torch.Tensor:
+        """
+        Per-key sum of the causal pre-fill attention over all query positions, shape
+        (batch_size, num_heads, seq_len). This is the importance signal LOOK-M
+        accumulates from the full eager attention map. When eager attention weights are
+        available they are summed directly; otherwise they are recomputed in query-chunks
+        of `chunk_size` so the full (seq_len, seq_len) map is never materialized at once.
+        """
+        if self.attentions is not None:
+            return self.attentions.sum(dim=-2)
+        return accumulated_attention_scores(
+            self.module, self.hidden_states, self.keys, self.position_embeddings, chunk_size
+        )
+
+    def accumulated_attention_and_entropy(self, chunk_size: int = 512) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Per-key attention sum (batch_size, num_heads, seq_len) and per-head attention
+        entropy (batch_size, num_heads) of the full causal pre-fill attention, both
+        accumulated over all queries. Used by MEDA, which needs the importance scores
+        and the multimodal attention entropy from the same attention map. Computed from
+        eager attention weights when available, otherwise recomputed in query-chunks so
+        the full (seq_len, seq_len) map is never materialized at once.
+        """
+        if self.attentions is not None:
+            clamped = self.attentions.clamp_min(1e-12)
+            return self.attentions.sum(dim=-2), -(clamped * clamped.log()).sum(dim=(-2, -1))
+        return accumulated_attention_and_entropy(
+            self.module, self.hidden_states, self.keys, self.position_embeddings, chunk_size
         )
 
     def to_kv_heads(self, scores: torch.Tensor) -> torch.Tensor:

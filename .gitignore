@@ -16,3 +16,7 @@ build/
 dist/
 tests/
 test.py
+
+# test data
+*.json
+*.csv

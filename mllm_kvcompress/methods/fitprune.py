@@ -42,8 +42,7 @@ class FitPrune(CompressionMethod):
       passed via `delete_schedule`.
     - The official implementation prunes hidden states (removing tokens from all
       subsequent compute). As a cache compression method, we drop the corresponding
-      KV pairs at each layer instead; cross-attention uses an observation window of
-      recent queries.
+      KV pairs at each layer instead.
 
     Parameters
     ----------
@@ -55,14 +54,11 @@ class FitPrune(CompressionMethod):
     start_layer : int, default=2
         First layer at which tokens are deleted (official fitted schemes delete
         almost nothing before layer 2).
-    window_size : int, default=32
-        Number of recent queries used for the cross-attention score.
     """
 
     ratio: float = 0.0
     delete_schedule: Optional[list[int]] = None
     start_layer: int = 2
-    window_size: int = 32
 
     _kept_vision: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
     _schedule: Optional[list[int]] = field(default=None, init=False, repr=False)
@@ -70,34 +66,44 @@ class FitPrune(CompressionMethod):
     def __post_init__(self):
         assert 0 <= self.ratio < 1, "ratio must be in [0, 1)"
 
-    def _init_schedule(self, num_layers: int, n_vision: int):
+    def _init_schedule(self, num_layers: int, n_vision: int, compressible_layers: list[int]):
         if self.delete_schedule is not None:
             self._schedule = list(self.delete_schedule)
             return
         total = int(n_vision * self.ratio)
-        active_layers = max(1, num_layers - self.start_layer)
-        per_layer = total // active_layers
+        # Spread deletions over the layers that actually compress (full-attention layers
+        # for hybrid models such as Qwen3.5, every layer for dense models) from
+        # start_layer onward, so the target ratio is reached regardless of the layout.
+        active = [i for i in compressible_layers if i >= self.start_layer] or compressible_layers or [num_layers - 1]
+        per_layer = total // len(active)
         schedule = [0] * num_layers
-        for layer_idx in range(self.start_layer, num_layers):
+        for layer_idx in active:
             schedule[layer_idx] = per_layer
-        schedule[num_layers - 1] += total - per_layer * active_layers
+        schedule[active[-1]] += total - per_layer * len(active)
         self._schedule = schedule
 
     def compress(self, ctx: LayerContext) -> tuple[torch.Tensor, torch.Tensor]:
-        if ctx.layer_idx == 0:
-            self._kept_vision = None
-            self._schedule = None
-            if self.ratio > 0 and ctx.vision_mask is not None:
-                if ctx.batch_size > 1:
-                    logger.warning_once("FitPrune currently supports batch_size=1, no compression applied.")
-                else:
-                    self._kept_vision = ctx.vision_mask[0].nonzero().squeeze(-1)
-                    self._init_schedule(ctx.num_layers, self._kept_vision.numel())
-            elif self.ratio > 0:
-                logger.warning_once("FitPrune could not find vision token positions, no compression is applied.")
-
-        if self._kept_vision is None or self._schedule is None:
+        if self.ratio == 0:
             return ctx.keys, ctx.values
+
+        if self._schedule is None:
+            # Lazy initialization on the first compressed layer. Keying off the schedule
+            # being unset (rather than layer_idx == 0) keeps this robust to models whose
+            # first full-attention layer is not index 0, e.g. the hybrid Qwen3.5 whose
+            # full-attention layers are [3, 7, 11, ...].
+            if ctx.batch_size > 1:
+                logger.warning_once("FitPrune currently supports batch_size=1, no compression applied.")
+                return ctx.keys, ctx.values
+            if ctx.vision_mask is None:
+                logger.warning_once("FitPrune could not find vision token positions, no compression is applied.")
+                return ctx.keys, ctx.values
+            layer_types = getattr(ctx.module.config, "layer_types", None)
+            if layer_types is not None:
+                compressible = [i for i, kind in enumerate(layer_types) if "full" in str(kind).lower()]
+            else:
+                compressible = list(range(ctx.num_layers))
+            self._kept_vision = ctx.vision_mask[0].nonzero().squeeze(-1)
+            self._init_schedule(ctx.num_layers, self._kept_vision.numel(), compressible)
 
         n_delete = min(self._schedule[ctx.layer_idx], max(0, self._kept_vision.numel() - 1))
         if n_delete > 0:
@@ -119,9 +125,22 @@ class FitPrune(CompressionMethod):
             attn = attn.max(dim=1).values[0]  # head-max, (n_vis, seq_len)
             self_score = attn[:, vis_pos].sum(dim=0) / vis_pos.numel()
 
-            # Cross-attention: recent (text) queries over the kept visual columns
-            window_attn = ctx.window_attention(self.window_size)
-            cross_score = window_attn.max(dim=1).values[0].sum(dim=0)[vis_pos]
+            # Cross-attention: every text query after the visual block over the kept
+            # visual columns (head-max, summed over the text rows), as in the reference.
+            last_vision = int(ctx.vision_mask[0].nonzero().max())
+            text_pos = torch.arange(last_vision + 1, ctx.seq_len, device=ctx.keys.device)
+            if text_pos.numel() > 0:
+                text_q = get_query_states(ctx.module, ctx.hidden_states[:, text_pos])
+                text_q = apply_rope_to_queries(
+                    text_q, cos[..., text_pos, :], sin[..., text_pos, :], get_mrope_section(ctx.module)
+                )
+                cross_attn = torch.matmul(text_q, keys_full.transpose(2, 3)) / math.sqrt(ctx.head_dim)
+                cross_causal = torch.arange(ctx.seq_len, device=ctx.keys.device)[None, :] > text_pos[:, None]
+                cross_attn = cross_attn.masked_fill(cross_causal[None, None], float("-inf"))
+                cross_attn = nn.functional.softmax(cross_attn, dim=-1, dtype=torch.float32)
+                cross_score = cross_attn.max(dim=1).values[0][:, vis_pos].sum(dim=0)
+            else:
+                cross_score = torch.ones_like(self_score)
 
             scores = self_score * cross_score.float()
             dropped = scores.topk(n_delete, largest=False).indices

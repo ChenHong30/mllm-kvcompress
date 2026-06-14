@@ -57,7 +57,6 @@ def text_prior_select_and_merge(
         post-RoPE keys of spatially distant tokens produces invalid keys that corrupt
         generation (measured: 6/20 vs 17/20 A-OKVQA accuracy at 50% compression).
         Key merging was validated by LOOK-M on LLaVA's standard 1D RoPE only.
-
     Returns
     -------
     tuple[torch.Tensor, torch.Tensor]
@@ -86,6 +85,123 @@ def text_prior_select_and_merge(
         kept_idx = torch.cat([hh_idx, kept_idx], dim=-1)
     kept_idx = kept_idx.sort(dim=-1).values
 
+    keep_mask = torch.zeros(bsz, num_kv_heads, k_len, dtype=torch.bool, device=keys.device)
+    keep_mask.scatter_(2, kept_idx, True)
+    return _merge_pruned_into_kept(
+        keys,
+        values,
+        kept_idx,
+        keep_mask,
+        merge,
+        merge_keys,
+        vision_mask=vision_mask,
+        restrict_targets_to_vision=True,
+    )
+
+
+def look_m_select_and_merge(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    scores: torch.Tensor,
+    vision_mask: Optional[torch.Tensor],
+    important_ratio: float,
+    recent_ratio: float,
+    merge: str,
+    merge_keys: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    LOOK-M selection and merge semantics as implemented in the reference LLaVA code.
+
+    The reference "text-prior + pivot-merge" path differs from the budgeted helper
+    above in two important ways:
+    - all non-recent text positions remain in the cache, regardless of the heavy-hitter
+      budget;
+    - evicted positions can be merged into any retained position, not only vision
+      positions.
+
+    If no vision token is present, the reference implementation does not compress the
+    layer; this helper follows that behavior.
+    """
+    assert merge in ("pivot", "average", "weighted", "none"), f"Unknown merge strategy: {merge}"
+    bsz, num_kv_heads, k_len, head_dim = keys.shape
+
+    if vision_mask is None or not vision_mask.any():
+        return keys, values
+
+    n_recent = max(0, min(int(k_len * recent_ratio), k_len))
+    n_hh = max(0, min(int(k_len * important_ratio), k_len - n_recent))
+    if n_recent == 0 and n_hh == 0:
+        return keys, values
+
+    non_recent_len = k_len - n_recent
+    keep_mask = torch.zeros(bsz, num_kv_heads, k_len, dtype=torch.bool, device=keys.device)
+
+    if n_recent > 0:
+        keep_mask[..., non_recent_len:] = True
+
+    if non_recent_len > 0:
+        non_recent_vision = vision_mask[:, None, :non_recent_len].expand(-1, num_kv_heads, -1)
+        keep_mask[..., :non_recent_len] |= ~non_recent_vision
+
+        if n_hh > 0:
+            adjusted_scores = scores[..., :non_recent_len].float()
+            adjusted_scores = adjusted_scores - non_recent_vision.float() * TEXT_PRIOR_PENALTY
+            hh_idx = adjusted_scores.topk(n_hh, dim=-1).indices
+            keep_mask.scatter_(2, hh_idx, True)
+
+    kept_count = keep_mask.sum(dim=-1)
+    n_kept = int(kept_count.max().item())
+    n_kept = max(1, min(n_kept, k_len))
+    if not kept_count.eq(n_kept).all():
+        _pad_keep_mask_to_uniform_length(keep_mask, scores.float(), n_kept)
+
+    kept_idx = _mask_to_sorted_indices(keep_mask, n_kept)
+    if n_kept == k_len:
+        return keys, values
+
+    return _merge_pruned_into_kept(
+        keys,
+        values,
+        kept_idx,
+        keep_mask,
+        merge,
+        merge_keys,
+        vision_mask=vision_mask,
+        restrict_targets_to_vision=False,
+    )
+
+
+def _pad_keep_mask_to_uniform_length(keep_mask: torch.Tensor, scores: torch.Tensor, n_kept: int) -> None:
+    """Fill rare per-head count mismatches so KV tensors remain rectangular."""
+    bsz, num_kv_heads, _ = keep_mask.shape
+    fill_scores = scores.masked_fill(keep_mask, float("-inf"))
+    for batch_idx in range(bsz):
+        for head_idx in range(num_kv_heads):
+            needed = n_kept - int(keep_mask[batch_idx, head_idx].sum().item())
+            if needed <= 0:
+                continue
+            fill_idx = fill_scores[batch_idx, head_idx].topk(needed, dim=-1).indices
+            keep_mask[batch_idx, head_idx, fill_idx] = True
+
+
+def _mask_to_sorted_indices(mask: torch.Tensor, n_indices: int) -> torch.Tensor:
+    idx = mask.float().argsort(dim=-1, descending=True, stable=True)[..., :n_indices]
+    return idx.sort(dim=-1).values
+
+
+def _merge_pruned_into_kept(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    kept_idx: torch.Tensor,
+    keep_mask: torch.Tensor,
+    merge: str,
+    merge_keys: bool,
+    vision_mask: Optional[torch.Tensor],
+    restrict_targets_to_vision: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    bsz, num_kv_heads, k_len, head_dim = keys.shape
+    n_kept = kept_idx.shape[-1]
+
     kept_idx_d = kept_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
     kept_keys = keys.gather(2, kept_idx_d)
     kept_values = values.gather(2, kept_idx_d)
@@ -94,9 +210,9 @@ def text_prior_select_and_merge(
         return kept_keys.contiguous(), kept_values.contiguous()
 
     # Evicted positions, in position order (stable argsort of the keep mask)
-    keep_mask = torch.zeros(bsz, num_kv_heads, k_len, dtype=torch.bool, device=keys.device)
-    keep_mask.scatter_(2, kept_idx, True)
     n_pruned = k_len - n_kept
+    if n_pruned <= 0:
+        return kept_keys.contiguous(), kept_values.contiguous()
     pruned_idx = (~keep_mask).float().argsort(dim=-1, descending=True, stable=True)[..., :n_pruned]
     pruned_idx = pruned_idx.sort(dim=-1).values
     pruned_idx_d = pruned_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
@@ -104,12 +220,8 @@ def text_prior_select_and_merge(
     pruned_values = values.gather(2, pruned_idx_d)
 
     # Assign each evicted KV pair to its most similar kept key (cosine similarity).
-    # Targets are restricted to kept *vision* positions: merging into text or recent
-    # KV pairs corrupts the prompt structure and degrades generation badly. (The
-    # official LOOK-M code merges into any kept position, but the paper describes
-    # merging evicted visual KVs into retained visual KVs.)
     similarity = torch.matmul(F.normalize(pruned_keys, dim=-1), F.normalize(kept_keys, dim=-1).transpose(-1, -2))
-    if vision_mask is not None:
+    if vision_mask is not None and restrict_targets_to_vision:
         kept_is_vision = vision_mask[:, None, :].expand(-1, num_kv_heads, -1).gather(2, kept_idx)
         if not kept_is_vision.any():
             return kept_keys.contiguous(), kept_values.contiguous()

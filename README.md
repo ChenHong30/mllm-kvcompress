@@ -29,6 +29,7 @@ This installs all runtime dependencies (`torch`, `transformers`, `pillow`). Opti
 ```bash
 pip install -e ".[dev]"       # + pytest, for running the test suite
 pip install -e ".[internvl]"  # + einops, timm, torchvision and transformers 4.x, for InternVL3
+pip install -e ".[bench]"     # + benchmark helpers (datasets, rouge, tqdm, ...)
 ```
 
 The `internvl` extra pins `transformers<5` because the InternVL3 remote code is incompatible with
@@ -64,18 +65,19 @@ processor-based and is intended for Qwen-style `AutoModelForImageTextToText` mod
 
 All methods are training-free and applied during pre-filling only.
 
-| Method | Paper | Idea |
-|---|---|---|
-| `LookM` | [LOOK-M](https://arxiv.org/abs/2406.18139) (Findings of EMNLP 2024) | Text-prior eviction + merging of evicted visual KVs |
-| `MEDA` | [MEDA](https://arxiv.org/abs/2502.17599) (NAACL 2025) | Layer-wise dynamic budgets via multimodal attention entropy |
-| `FastV` | [FastV](https://arxiv.org/abs/2403.06764) (ECCV 2024 Oral) | Vision token pruning after an early filter layer |
-| `FitPrune` | [FitPrune](https://arxiv.org/abs/2409.10197) (AAAI 2025) | Progressive vision token pruning with a per-layer schedule |
-| `SparseMM` | [SparseMM](https://arxiv.org/abs/2506.05344) (NeurIPS 2025) | Head-wise budgets driven by visual-head importance |
-| `MixKV` | [MixKV](https://arxiv.org/abs/2511.03878) | Mixing importance and diversity scores per head |
-| `GUIKV` | [GUI-KV](https://arxiv.org/abs/2510.00536) | Spatial saliency + temporal redundancy, for GUI agents |
-| `STaRKV` | [STaR-KV](https://github.com/kawhiiiileo/STaR-KV) | Spatial MI prior + entropy-guided score sharpening |
-| `InfiniPotV` | [InfiniPot-V](https://arxiv.org/abs/2506.15745) (NeurIPS 2025) | Vision-only eviction (temporal redundancy + value norm), streaming video |
-| `VidKV` | [VidKV](https://arxiv.org/abs/2503.16257) | ~1.x-bit mixed-precision KV quantization of vision tokens (simulated) |
+| Method       | Source                                                                                                                                                                                                                   | Idea                                                                     |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| `LookM`      | [Paper](https://aclanthology.org/2024.findings-emnlp.235/) · [Code](https://github.com/SUSTechBruce/LOOK-M) (Findings of EMNLP 2024)                                                                                     | Text-prior eviction + merging of evicted visual KVs                      |
+| `MEDA`       | [Paper](https://aclanthology.org/2025.naacl-long.125/) · [Code](https://github.com/aiot-mlsys-lab/meda) (NAACL 2025)                                                                                                     | Layer-wise dynamic budgets via multimodal attention entropy              |
+| `FastV`      | [Paper](https://arxiv.org/abs/2403.06764) · [Code](https://github.com/pkunlp-icler/FastV) (ECCV 2024 Oral)                                                                                                               | Vision token pruning after an early filter layer                         |
+| `FitPrune`   | [Paper](https://ojs.aaai.org/index.php/AAAI/article/view/34366) · [Code](https://github.com/ywh187/FitPrune) (AAAI 2025)                                                                                                 | Progressive vision token pruning with a per-layer schedule               |
+| `SparseMM`   | [Paper](https://openaccess.thecvf.com/content/ICCV2025/html/Wang_SparseMM_Head_Sparsity_Emerges_from_Visual_Concept_Responses_in_MLLMs_ICCV_2025_paper.html) · [Code](https://github.com/CR400AF-A/SparseMM) (ICCV 2025) | Head-wise budgets driven by visual-head importance                       |
+| `MixKV`      | [Paper](https://arxiv.org/abs/2510.20707) · [Code](https://github.com/xuyang-liu16/MixKV) (ICLR 2026 Poster)                                                                                                             | Mixing importance and diversity scores per head                          |
+| `GUIKV`      | [Paper](https://arxiv.org/abs/2510.00536) · [Code](https://github.com/SalesforceAIResearch/GUI-KV)                                                                                                                       | Spatial saliency + temporal redundancy, for GUI agents                   |
+| `STaRKV`     | [Paper](https://arxiv.org/abs/2606.01790) · [Code](https://github.com/kawhiiiileo/STaR-KV)                                                                                                                               | Spatial MI prior + entropy-guided score sharpening                       |
+| `InfiniPotV` | [Paper](https://openreview.net/forum?id=hFxOZjHyTg) · [Code](https://github.com/aiha-lab/InfiniPot-V) (NeurIPS 2025 Poster)                                                                                              | Vision-only eviction (temporal redundancy + value norm), streaming video |
+| `VidKV`      | [Paper](https://arxiv.org/abs/2503.16257) · [Code](https://github.com/KD-TAO/VidKV)                                                                                                                                      | ~1.x-bit mixed-precision KV quantization of vision tokens                |
+
 
 Deviations from the official implementations (and the measurements behind them) are documented in each
 method's docstring.
@@ -165,47 +167,6 @@ result = pipe(
 )
 print(result["answers"])
 ```
-
-### Writing your own method
-
-A method receives a `LayerContext` per attention layer at the end of pre-filling and returns the compressed
-keys and values. For score-then-evict methods, subclass `ScoredEviction` and only implement `score`:
-
-```python
-from dataclasses import dataclass
-import torch
-from mllm_kvcompress import ScoredEviction, LayerContext
-
-@dataclass
-class VisionValueNorm(ScoredEviction):
-    """Evict the vision KV pairs with the smallest value norm; keep all text."""
-
-    def score(self, ctx: LayerContext) -> torch.Tensor:
-        scores = ctx.values.norm(dim=-1)                      # (batch, kv_heads, seq_len)
-        if ctx.vision_mask is not None:                       # protect text positions
-            scores = scores.masked_fill(~ctx.vision_mask[:, None], torch.finfo(scores.dtype).max)
-        return scores
-```
-
-`LayerContext` exposes the layer's KV pairs, the vision token mask (`ctx.vision_mask`), per-image spans
-(`ctx.vision_token_spans`), and mrope-aware attention scores (`ctx.window_attention(window_size)`). Methods
-that need cross-layer information (e.g. global budget allocation) can register `post_prefill_hooks` — see
-`methods/meda.py` for a complete example.
-
-### How it works
-
-The runtime (`core/runtime.py`) installs three kinds of hooks:
-
-1. A pre-hook on the multimodal backbone captures **which positions are vision tokens** from the input ids —
-   the core requirement of modality-aware methods.
-2. A hook on every attention layer fires at the end of pre-filling, builds a `LayerContext` and writes the
-   method's compressed KV pairs back into the cache in place. Decoding is never touched.
-3. Optional post-prefill hooks for methods that act across layers.
-
-Importance scores are computed from an observation window of recent queries with the model's multimodal
-rotary embeddings (3D mrope) applied, since full attention maps are unavailable under sdpa/flash attention.
-Methods with per-head budgets (SparseMM) use virtual eviction: evicted keys are neutralized during decoding
-instead of physically removed.
 
 ## Development
 

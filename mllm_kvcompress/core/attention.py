@@ -126,6 +126,112 @@ def observation_window_attention(
     return nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
 
+def _causal_chunk_attention(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    key_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    mrope_section: list[int] | None,
+    scale: float,
+    start: int,
+    end: int,
+) -> torch.Tensor:
+    """Causal softmax attention of query positions [start:end] over all keys, fp32,
+    shape (batch_size, num_heads, end - start, k_len)."""
+    k_len = key_states.shape[2]
+    cos, sin = position_embeddings
+    query_states = get_query_states(module, hidden_states[:, start:end])
+    query_states = apply_rope_to_queries(
+        query_states, cos[..., start:end, :], sin[..., start:end, :], mrope_section
+    )
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / scale
+    # Query at absolute position start + r attends to keys 0..start + r.
+    causal_mask = torch.triu(
+        torch.ones(end - start, k_len, dtype=torch.bool, device=attn_weights.device), diagonal=start + 1
+    )
+    attn_weights = attn_weights.masked_fill(causal_mask, float("-inf"))
+    return nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
+
+
+def accumulated_attention_scores(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    keys: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    chunk_size: int,
+) -> torch.Tensor:
+    """
+    Sum over every query position of the causal pre-fill attention weights each key
+    receives, shape (batch_size, num_heads, seq_len).
+
+    This is the exact quantity LOOK-M's reference implementation accumulates from the
+    full eager attention map (a sum over all query rows). Recomputing that map at once
+    is O(seq_len ** 2) and does not fit in memory for the long contexts of recent
+    multimodal models. The sum is therefore computed in query-chunks: each query's
+    softmax is normalized over its own causal prefix independently of other queries, so
+    accumulating chunk by chunk yields the same result while only materializing a
+    (chunk_size, seq_len) block at a time (peak memory O(chunk_size * seq_len)).
+
+    Returns scores of shape (batch_size, num_heads, seq_len).
+    """
+    q_len = hidden_states.shape[1]
+    num_key_value_groups = module.config.num_attention_heads // module.config.num_key_value_heads
+    key_states = repeat_kv(keys, num_key_value_groups)
+    mrope_section = get_mrope_section(module)
+    scale = math.sqrt(module.head_dim)
+
+    scores = None
+    for start in range(0, q_len, chunk_size):
+        end = min(start + chunk_size, q_len)
+        attn_weights = _causal_chunk_attention(
+            module, hidden_states, key_states, position_embeddings, mrope_section, scale, start, end
+        )
+        chunk_scores = attn_weights.sum(dim=-2)
+        scores = chunk_scores if scores is None else scores + chunk_scores
+    return scores
+
+
+def accumulated_attention_and_entropy(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    keys: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Accumulate, over all query positions of the causal pre-fill attention, both the
+    per-key attention sum and the attention entropy, computed in query-chunks (see
+    `accumulated_attention_scores`).
+
+    Returns
+    -------
+    scores : torch.Tensor
+        Per-key attention sum, shape (batch_size, num_heads, seq_len).
+    entropy : torch.Tensor
+        Per-head attention entropy `-sum(A * log A)` over all (query, key) pairs, shape
+        (batch_size, num_heads). MEDA uses its head mean divided by the query count.
+    """
+    q_len = hidden_states.shape[1]
+    num_key_value_groups = module.config.num_attention_heads // module.config.num_key_value_heads
+    key_states = repeat_kv(keys, num_key_value_groups)
+    mrope_section = get_mrope_section(module)
+    scale = math.sqrt(module.head_dim)
+
+    scores = None
+    entropy = None
+    for start in range(0, q_len, chunk_size):
+        end = min(start + chunk_size, q_len)
+        attn_weights = _causal_chunk_attention(
+            module, hidden_states, key_states, position_embeddings, mrope_section, scale, start, end
+        )
+        chunk_scores = attn_weights.sum(dim=-2)
+        clamped = attn_weights.clamp_min(1e-12)
+        chunk_entropy = -(clamped * clamped.log()).sum(dim=(-2, -1))
+        scores = chunk_scores if scores is None else scores + chunk_scores
+        entropy = chunk_entropy if entropy is None else entropy + chunk_entropy
+    return scores, entropy
+
+
 def group_mean(scores: torch.Tensor, num_key_value_heads: int) -> torch.Tensor:
     """
     Average scores over grouped query heads (GQA).
