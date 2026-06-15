@@ -257,7 +257,14 @@ def summarize_results(output_dir: str | Path, model_names: list[str]) -> dict[st
 def write_csv_summary(path: str | Path, result: dict[str, Any]):
     rows = []
     columns = ["Model"]
-    ignored = {"image_quantity_level-Accuracy", "image_quantity_level-Result", "Diff-Accuracy"}
+    ignored = {
+        "image_quantity_level-Accuracy",
+        "image_quantity_level-Result",
+        "Diff-Accuracy",
+        "num_samples",
+        "num_labeled",
+        "num_unlabeled",
+    }
     for model_name, groups in result.items():
         row = {"Model": model_name}
         for datasets in groups.values():
@@ -265,10 +272,14 @@ def write_csv_summary(path: str | Path, result: dict[str, Any]):
                 for metric, value in metrics.items():
                     if metric in ignored or isinstance(value, dict):
                         continue
+                    try:
+                        numeric_value = float(value)
+                    except (TypeError, ValueError):
+                        continue
                     column = f"{dataset} ({metric})"
                     if column not in columns:
                         columns.append(column)
-                    row[column] = round(float(value) * 100, 2) if not math.isnan(float(value)) else ""
+                    row[column] = round(numeric_value * 100, 2) if not math.isnan(numeric_value) else ""
         rows.append(row)
 
     path = Path(path)

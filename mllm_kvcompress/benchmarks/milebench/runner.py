@@ -12,7 +12,8 @@ from typing import Any, Callable
 
 import torch
 
-from mllm_kvcompress import CompressionMethod, METHODS
+from mllm_kvcompress.core import CompressionMethod
+from mllm_kvcompress.methods import parse_setting, parse_settings
 from mllm_kvcompress.benchmarks import load_model_adapter
 from mllm_kvcompress.benchmarks.milebench.data import (
     build_samples,
@@ -214,75 +215,6 @@ def _generate_dataset(
                 flush=True,
             )
     return predictions
-
-
-def parse_settings(settings: str) -> list[tuple[str, Callable[[], CompressionMethod | None]]]:
-    if not settings or settings == "all":
-        names = ["baseline"] + sorted(METHODS)
-    else:
-        names = [item.strip() for item in settings.split(",") if item.strip()]
-
-    parsed = []
-    for name in names:
-        setting_name, factory = parse_setting(name)
-        parsed.append((setting_name, factory))
-    return parsed
-
-
-def parse_setting(setting: str) -> tuple[str, Callable[[], CompressionMethod | None]]:
-    if setting == "baseline":
-        return "baseline", lambda: None
-
-    method_name, kwargs = _parse_method_setting(setting)
-    if method_name not in METHODS:
-        raise ValueError(f"Unknown compression method '{method_name}'. Available: {['baseline', *sorted(METHODS)]}")
-
-    def factory():
-        return METHODS[method_name](**kwargs)
-
-    suffix = "_".join(f"{key}{value}" for key, value in kwargs.items())
-    setting_name = method_name if not suffix else f"{method_name}_{suffix}"
-    return setting_name, factory
-
-
-def _parse_method_setting(setting: str) -> tuple[str, dict[str, Any]]:
-    if ":" in setting:
-        method_name, raw_kwargs = setting.split(":", 1)
-        kwargs = {}
-        for item in raw_kwargs.replace("|", ";").split(";"):
-            item = item.strip()
-            if not item:
-                continue
-            key, value = item.split("=", 1)
-            kwargs[key.strip()] = _parse_value(value.strip())
-        return method_name.replace("-", "_"), kwargs
-
-    normalized = setting.replace("-", "_")
-    for method_name in sorted(METHODS, key=len, reverse=True):
-        prefix = f"{method_name}_"
-        if normalized.startswith(prefix):
-            tail = normalized[len(prefix) :]
-            try:
-                return method_name, {"ratio": float(tail)}
-            except ValueError:
-                pass
-    return normalized, {}
-
-
-def _parse_value(value: str):
-    lowered = value.lower()
-    if lowered in {"true", "false"}:
-        return lowered == "true"
-    if lowered in {"none", "null"}:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    try:
-        return float(value)
-    except ValueError:
-        return value
 
 
 def main(argv: list[str] | None = None):

@@ -18,7 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest"]
 internvl = ["transformers>=4.55.0,<5", "einops", "timm", "torchvision"]
-bench = ["datasets", "huggingface_hub", "protobuf", "rouge", "sentencepiece", "tqdm"]
+bench = ["datasets", "huggingface_hub", "pandas", "protobuf", "pycocoevalcap", "rouge", "sentencepiece", "tqdm"]
 
 [tool.setuptools.packages.find]
 include = ["mllm_kvcompress*"]

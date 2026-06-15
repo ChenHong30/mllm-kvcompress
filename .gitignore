@@ -6,6 +6,7 @@ paper_code_search.md
 # local assets
 model_weight/
 external_source/
+release_check/
 
 # python
 __pycache__/
@@ -14,7 +15,6 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
-tests/
 test.py
 
 # test data
